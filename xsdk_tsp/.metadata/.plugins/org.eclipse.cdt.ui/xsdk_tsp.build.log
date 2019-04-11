@@ -1,0 +1,8 @@
+22:02:11 **** Incremental Build of configuration Debug for project xsdk_tsp ****
+make pre-build main-build 
+a9-linaro-pre-build-step
+ 
+make: Nothing to be done for `main-build'.
+
+22:02:11 Build Finished (took 67ms)
+

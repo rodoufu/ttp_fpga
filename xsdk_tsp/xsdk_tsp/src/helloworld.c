@@ -1,0 +1,364 @@
+/******************************************************************************
+*
+* Copyright (C) 2009 - 2014 Xilinx, Inc.  All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a copy
+* of this software and associated documentation files (the "Software"), to deal
+* in the Software without restriction, including without limitation the rights
+* to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+* copies of the Software, and to permit persons to whom the Software is
+* furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* Use of the Software is limited solely to applications:
+* (a) running on a Xilinx device, or
+* (b) that interact with a Xilinx device through a bus or interconnect.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+* XILINX  BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+* WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF
+* OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+* SOFTWARE.
+*
+* Except as contained in this notice, the name of the Xilinx shall not be used
+* in advertising or otherwise to promote the sale, use or other dealings in
+* this Software without prior written authorization from Xilinx.
+*
+******************************************************************************/
+
+/*
+ * helloworld.c: simple test application
+ *
+ * This application configures UART 16550 to baud rate 9600.
+ * PS7 UART (Zynq) is not initialized by this application, since
+ * bootrom/bsp configures it to baud rate 115200
+ *
+ * ------------------------------------------------
+ * | UART TYPE   BAUD RATE                        |
+ * ------------------------------------------------
+ *   uartns550   9600
+ *   uartlite    Configurable only in HW design
+ *   ps7_uart    115200 (configured by bootrom/bsp)
+ */
+#include <stdio.h>
+#include <math.h>
+#include "platform.h"
+#include "xil_printf.h"
+#include "xcost_func.h"
+#include "xtime_l.h"
+#include "xil_cache.h"
+
+enum NeighborhoodType {
+	None = 0,
+	NotBit = 1,
+
+	Permutation = 1 << 1,
+	Inversion = 1 << 2,
+	ShiftLeft = 1 << 3,
+	ShiftRight = 1 << 4,
+
+	PermutationNotBit = Permutation | NotBit,
+	InversionNotBit = Inversion | NotBit,
+	ShiftLeftNotBit = ShiftLeft | NotBit,
+	ShiftRightNotBit = ShiftRight | NotBit
+};
+
+#define VELOCIDADE(PESO, CAPACIDADE, VEL_MIN, VEL_MAX) (VEL_MAX - (PESO < CAPACIDADE ? PESO : CAPACIDADE) * (VEL_MAX - VEL_MIN) / CAPACIDADE)
+
+#define NEIGHBOR_SHIFT_LEFT_NL(WINDOW_START, WINDOW_END, INDEX, N, LARGURA) \
+	((INDEX) < (WINDOW_START) || (INDEX) > (WINDOW_END)) ? (INDEX) : \
+		(WINDOW_START) + (((INDEX) - (WINDOW_START) + (N)) % (LARGURA) + (LARGURA)) % (LARGURA)
+#define NEIGHBOR_SHIFT_LEFT_N(WINDOW_START, WINDOW_END, INDEX, N) (NEIGHBOR_SHIFT_LEFT_NL(WINDOW_START, WINDOW_END, INDEX, N, ((WINDOW_END) - (WINDOW_START) + 1)))
+#define NEIGHBOR_SHIFT_RIGHT_N(WINDOW_START, WINDOW_END, INDEX, N) NEIGHBOR_SHIFT_LEFT_N(WINDOW_START, WINDOW_END, INDEX, -(N))
+#define NEIGHBOR_SHIFT_LEFT(WINDOW_START, WINDOW_END, INDEX) NEIGHBOR_SHIFT_LEFT_N(WINDOW_START, WINDOW_END, INDEX, 1)
+#define NEIGHBOR_SHIFT_RIGHT(WINDOW_START, WINDOW_END, INDEX) NEIGHBOR_SHIFT_RIGHT_N(WINDOW_START, WINDOW_END, INDEX, 1)
+#define NEIGHBOR_PERMUTATION(WINDOW_START, WINDOW_END, INDEX) ((INDEX) != (WINDOW_START) && (INDEX) != (WINDOW_END) ? (INDEX) : ((INDEX) != (WINDOW_START) ? (WINDOW_START) : (WINDOW_END)))
+#define NEIGHBOR_INVERSION_VER(WINDOW_START, WINDOW_END, INDEX) \
+	(((INDEX) < (WINDOW_START) || (INDEX) > (WINDOW_END)) ? (INDEX) : \
+		((WINDOW_START) - (INDEX) + (WINDOW_END)))
+#define NEIGHBOR_INVERSION(WINDOW_START, WINDOW_END, INDEX) (((WINDOW_START) < (WINDOW_END)) ? NEIGHBOR_INVERSION_VER(WINDOW_START, WINDOW_END, INDEX) : NEIGHBOR_INVERSION_VER(WINDOW_END, WINDOW_START, INDEX))
+
+#define GET_PERCURSO_INDEX(type, x, y, index) \
+	(Permutation & type ? NEIGHBOR_PERMUTATION(x, y, index) : \
+	(Inversion & type ? NEIGHBOR_INVERSION(x, y, index) : \
+	(ShiftLeft & type ? NEIGHBOR_SHIFT_LEFT(x, y, index) : \
+	(ShiftRight & type ? NEIGHBOR_SHIFT_RIGHT(x, y, index) : index))))
+#define GET_MOCHILA_VALUE(type, array, z, index) ((NotBit & type) && (index == z) ? !array[index] : array[index])
+#define DIST_PONTO(Ai, Bi) sqrt((pontoX[Ai] - pontoX[Bi]) * (pontoX[Ai] - pontoX[Bi]) + (pontoY[Ai] - pontoY[Bi]) * (pontoY[Ai] - pontoY[Bi]))
+
+XCost_func_Config* xfe_cfg;
+XCost_func xfe;
+XTime t1, t2, t3, t4, tempo1, tempo2, tempoAcumulado1, tempoAcumulado2;
+
+typedef union
+{
+	double d;
+	u64 u;
+}d64;
+
+void cost_func_local(
+		/*volatile int x, volatile int y, volatile int z, NeighborhoodType localsearch,*/
+		int quantidadeCidades, int quantidadeItens, int capacidadeMochila,
+		double velocidadeMaxima, double velocidadeMinima, double aluguel,
+		volatile int *itemValor, volatile int *itemPeso,
+		volatile int *inicioItensCidade, volatile int *indiceItemCidade,
+		volatile int *pontoX, volatile int *pontoY,
+		volatile int *percurso, volatile int *mochila, volatile double *resposta);
+
+int main() {
+	init_platform();
+	Xil_DCacheDisable();
+
+	xfe_cfg = XCost_func_LookupConfig(0);
+	XCost_func_CfgInitialize(&xfe, xfe_cfg);
+
+	XCost_func_DisableAutoRestart(&xfe);
+	XCost_func_InterruptGlobalDisable(&xfe);
+//	XCost_func_InterruptDisable(&xfe);
+
+	//double velocidadeMaxima = 1.00000;
+	//double velocidadeMinima = 0.10000;
+	//double aluguel = 1.25000;
+
+	/*
+	d64 velocidadeMaxima;
+	d64 velocidadeMinima;
+	d64 aluguel;
+
+	velocidadeMaxima.d = 1.00000;
+	velocidadeMinima.d = 0.10000;
+	aluguel.d = 1.25000;
+	int quantidadeCidades = 52;
+	int quantidadeItens = 51;
+	int capacidadeMochila = 22450;
+	*/
+
+	int quantidadeCidades = 51;
+	int quantidadeItens = 50;
+	int capacidadeMochila = 22264;
+
+	double velocidadeMaxima = 1.00000;
+	double velocidadeMinima = 0.10000;
+	double aluguel = 22.33000;
+
+	int itemValor[] = { 119, 187, 997, 22, 347, 522, 730, 705, 232, 554, 675,
+			970, 407, 276, 331, 361, 798, 427, 439, 91, 650, 10, 838, 725, 843,
+			137, 977, 718, 99, 609, 819, 97, 975, 226, 241, 584, 348, 475, 178,
+			641, 898, 250, 391, 101, 636, 87, 652, 867, 54, 509 };
+
+	int itemPeso[] = {
+	    1,   896,   367,   690,   613,   874,   122,   486,   823,   463,   589,   325,  1000,   776,   123,   356,   305,    47,   645,   139,
+	  247,   211,   100,   627,   760,   776,   475,   937,   101,   281,   751,   530,   240,   248,   768,    31,   613,   881,   367,   712,
+	  410,   157,   824,   242,   472,   722,   775,   371,   337,   885
+	};
+
+	int inicioItensCidade[] = {
+	  0,   0,   1,   2,   3,   4,   5,   6,   7,   8,   9,  10,  11,  12,  13,  14,  15,  16,  17,  18,
+	 19,  20,  21,  22,  23,  24,  25,  26,  27,  28,  29,  30,  31,  32,  33,  34,  35,  36,  37,  38,
+	 39,  40,  41,  42,  43,  44,  45,  46,  47,  48,  49
+	};
+	int indiceItemCidade[] = {
+	  0,   1,   2,   3,   4,   5,   6,   7,   8,   9,  10,  11,  12,  13,  14,  15,  16,  17,  18,  19,
+	 20,  21,  22,  23,  24,  25,  26,  27,  28,  29,  30,  31,  32,  33,  34,  35,  36,  37,  38,  39,
+	 40,  41,  42,  43,  44,  45,  46,  47,  48,  49
+	};
+
+	int pontoX[] = {
+	   37,    49,    52,    20,    40,    21,    17,    31,    52,    51,    42,    31,     5,    12,    36,    52,    27,    17,    13,    57,
+	   62,    42,    16,     8,     7,    27,    30,    43,    58,    58,    37,    38,    46,    61,    62,    63,    32,    45,    59,     5,
+	   10,    21,     5,    30,    39,    32,    25,    25,    48,    56,    30
+	};
+	int pontoY[] = {
+	   52,    49,    64,    26,    30,    47,    63,    62,    33,    21,    41,    32,    25,    42,    16,    41,    23,    33,    13,    58,
+	   42,    57,    57,    52,    38,    68,    48,    67,    48,    27,    69,    46,    10,    33,    63,    69,    22,    35,    15,     6,
+	   17,    10,    64,    15,    10,    39,    32,    55,    28,    37,    40
+	};
+
+	int percurso[] = {
+	 14,  50,   0,   9,  11,   5,  20,  26,  32,  25,  46,  22,  13,  18,  21,  39,  34,  36,  45,   4,
+	 48,  10,  24,  38,   2,  28,  49,   8,   7,   6,  29,   3,  30,  17,  47,  16,   1,  40,  31,  19,
+	 43,  12,  37,  44,  27,  33,  35,  23,  42,  15,  41
+	};
+	int mochila[] = {
+	1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1, 0, 1, 0, 1, 1, 1, 1,
+	0, 1, 1, 1, 1, 1, 1, 0, 1, 1, 0, 1, 1, 0, 1, 1, 0, 1, 1, 1,
+	1, 1, 1, 1, 1, 1, 1, 1, 1, 0
+	};
+
+	const double cpuSolutionValue = -52681.16901;
+
+	XCost_func_Set_itemValor(&xfe, (u32) itemValor);
+	XCost_func_Set_itemPeso(&xfe, (u32) itemPeso);
+
+	XCost_func_Set_inicioItensCidade(&xfe, (u32) inicioItensCidade);
+	XCost_func_Set_indiceItemCidade(&xfe, (u32) indiceItemCidade);
+
+	XCost_func_Set_pontoX(&xfe, (u32) pontoX);
+	XCost_func_Set_pontoY(&xfe, (u32) pontoY);
+
+	XCost_func_Set_percurso(&xfe, (u32) percurso);
+	XCost_func_Set_mochila(&xfe, (u32) mochila);
+
+	XCost_func_Set_quantidadeCidades(&xfe, quantidadeCidades);
+	XCost_func_Set_quantidadeItens(&xfe, quantidadeItens);
+	XCost_func_Set_capacidadeMochila(&xfe, capacidadeMochila);
+
+	XCost_func_Set_velocidadeMaxima(&xfe, *((u64*)&velocidadeMaxima));
+	XCost_func_Set_velocidadeMinima(&xfe, *((u64*)&velocidadeMinima));
+	XCost_func_Set_aluguel(&xfe, *((u64*)&aluguel));
+	/*
+	XCost_func_Set_velocidadeMaxima(&xfe, velocidadeMaxima.u);
+	XCost_func_Set_velocidadeMinima(&xfe, velocidadeMinima.u);
+	XCost_func_Set_aluguel(&xfe, aluguel.u);
+	*/
+
+	double respostaFpga = 0;
+	// Valores berlin 51x50 - End
+
+	tempoAcumulado1 = tempoAcumulado2 = 0;
+	u64 r;
+
+	r = XCost_func_Get_resposta(&xfe);
+	respostaFpga = *((double*)&r);
+	printf("r = %lf\n\r",respostaFpga);
+
+	printf("cpuExpected;fpgaValue;respostaLocal;cyclesFpga;cyclesLocal;melhora;melhoraP\n\r");
+
+	int testes = 1;
+	for (int i = 0; i < testes; i++) {
+		XTime_GetTime(&t1);
+		XCost_func_Start(&xfe);
+
+
+		while (!XCost_func_IsDone(&xfe));
+		//while (!XCost_func_IsIdle(&xfe));
+
+		r = XCost_func_Get_resposta(&xfe);
+		respostaFpga = *((double*)&r);
+		/*
+		printf("r = %lf\n\r",respostaFpga);
+		r = XCost_func_Get_resposta(&xfe);
+		respostaFpga = *((double*)&r);
+		printf("r = %lf\n\r",respostaFpga);
+		r = XCost_func_Get_resposta(&xfe);
+		respostaFpga = *((double*)&r);
+		printf("r = %lf\n\r",respostaFpga);
+		r = XCost_func_Get_resposta(&xfe);
+		respostaFpga = *((double*)&r);
+		printf("r = %lf\n\r",respostaFpga);
+		*/
+
+		XTime_GetTime(&t2);
+
+		respostaFpga = *((double*)&r);
+
+		double respostaLocal;
+
+		XTime_GetTime(&t3);
+		cost_func_local(quantidadeCidades, quantidadeItens, capacidadeMochila,
+				velocidadeMaxima, velocidadeMinima, aluguel,
+				itemValor, itemPeso,
+				inicioItensCidade, indiceItemCidade,
+				pontoX, pontoY,
+				percurso, mochila, &respostaLocal);
+		XTime_GetTime(&t4);
+		tempo1 = 2 * (t2 - t1);
+		tempo2 = 2 * (t4 - t3);
+		tempoAcumulado1 += tempo1;
+		tempoAcumulado2 += tempo2;
+
+		//printf("expected: %lf, actual: %lld\n\r", cpuSolutionValue, r);
+		//printf("expected: %lf, fpga: %lf, local: %lf\n\r", cpuSolutionValue, respostaFpga, respostaLocal);
+		//printf("cyclesFpga = %lld, cyclesLocal = %lld, melhora = %lld (%lf%%)\n\r", tempo1, tempo2, tempo2 - tempo1, (100.0 * (tempo2 - tempo1)) / tempo1);
+		printf("%lf;%lf;%lf;%lld;%lld;%lld;%lf\n\r", cpuSolutionValue, respostaFpga, respostaLocal, tempo1, tempo2, tempo2 - tempo1,(100.0 * (tempo2 - tempo1)) / tempo1);
+	}
+	printf("acumuladoFpga = %.2lf, acumuladoLocal = %.2lf, melhora = %.2lf (%lf%%), %d testes\n\r",
+			((double) tempoAcumulado1) / testes,
+			((double) tempoAcumulado2) / testes,
+			((double) tempoAcumulado2 - tempoAcumulado1) / testes,
+			(100.0 * (tempoAcumulado2 - tempo1)) / (tempoAcumulado1 * testes),
+			testes);
+
+	cleanup_platform();
+	return 0;
+}
+
+void cost_func_local(
+		/*volatile int x, volatile int y, volatile int z, NeighborhoodType localsearch,*/
+		int quantidadeCidades, int quantidadeItens, int capacidadeMochila,
+		double velocidadeMaxima, double velocidadeMinima, double aluguel,
+		volatile int *itemValor, volatile int *itemPeso,
+		volatile int *inicioItensCidade, volatile int *indiceItemCidade,
+		volatile int *pontoX, volatile int *pontoY,
+		volatile int *percurso, volatile int *mochila, volatile double *resposta) {
+
+//	const unsigned int numberOfCities = 51;
+//	const unsigned int numberOfItens = 50;
+	const int x = 0;
+	const int y = 0;
+	const int z = 0;
+	short localsearch = None;
+
+	//int i;
+	//int buff[50];
+
+	//memcpy creates a burst access to memory
+	//multiple calls of memcpy cannot be pipelined and will be scheduled sequentially
+	//memcpy requires a local buffer to store the results of the memory transaction
+	/*
+	memcpy(buff, (const int*) a, 50 * sizeof(int));
+
+	for (i = 0; i < 50; i++) {
+		buff[i] = buff[i] + 100;
+	}
+	*/
+
+	/* Implementação - Begin */
+	int penalidade = -3;
+
+		double coletado = 0;
+		double custo = 0;
+		int peso = 0;
+
+
+		for (int j = 0; j < quantidadeItens; j++) {
+			if (GET_MOCHILA_VALUE(localsearch, mochila, z, j)) {
+				// Penalisar quando ultrapassar o peso da mochila
+				coletado += peso <= capacidadeMochila ? itemValor[j] : penalidade * itemValor[j];
+				// Sem alterar o peso não vai penalisar quando estiver acima da capacidade
+				peso += itemPeso[j];
+			}
+		}
+
+		// Zerar o peso para calcular a velocidade atual no peso atual
+		peso = 0;
+		int indexI = GET_PERCURSO_INDEX(localsearch, x, y, 0);
+		int indexImaisUm;
+		for (int i = 0; i < quantidadeCidades; i++) {
+			int inicioItensCidadeI = inicioItensCidade[i];
+			int fimIntensCidadeI = inicioItensCidade[i + 1];
+			indexImaisUm = GET_PERCURSO_INDEX(localsearch, x, y, (i + 1) % quantidadeCidades);
+			for (int k = inicioItensCidadeI; k < fimIntensCidadeI; k++) {
+			//for (int k = inicioItensCidadeI; k < inicioItensCidadeI + 1; k++) {
+				int j = indiceItemCidade[k];
+
+				if (GET_MOCHILA_VALUE(localsearch, mochila, z, j)) {
+					peso += itemPeso[j];
+				}
+			}
+			custo += DIST_PONTO(percurso[indexI], percurso[indexImaisUm])
+					/ VELOCIDADE(peso, capacidadeMochila, velocidadeMinima, velocidadeMaxima);
+
+			indexI = indexImaisUm;
+		}
+
+		*resposta = coletado - aluguel * custo;
+
+	/* Implementação - End */
+
+	//memcpy((int *) a, buff, 50 * sizeof(int));
+}
